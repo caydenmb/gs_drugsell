@@ -1,0 +1,18 @@
+Locales = {
+    sell_prompt    = 'Press ~INPUT_CONTEXT~ to talk',
+    no_ped         = 'Look at someone close enough to talk.',
+    not_interested = 'They\'re not interested.',
+    too_far        = 'Too far away.',
+    no_items       = 'You don\'t have anything to sell.',
+    cooldown       = 'Take a breather...',
+    cops_low       = 'City is too quiet right now.',
+    zone_block     = 'Not a good place for that.',
+    selling        = 'Making the handoff...',
+    sold           = 'Deal done: $%s',
+    canceled       = 'You backed out.',
+    failed         = 'Sale failed.',
+    alert_sent     = 'Someone might have seen that...',
+    invalid        = 'Invalid or expired offer.',
+    snitched       = 'They look nervous... someone might have called it in.',
+    bad_product    = 'They didn\'t like the product. No deal.',
+}
