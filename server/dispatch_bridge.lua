@@ -1,51 +1,36 @@
 local Debug = Debug or require 'shared/debug'
 local bridge = {}
 
--- Cached provider choice & state
 local chosenProvider = nil
-
--- Cooldowns per suspect
 bridge._cooldowns = bridge._cooldowns or {}
-
--- Active tracks: suspectSrc -> { id, endAt, nextAt }
-bridge._tracks = bridge._tracks or {}
-
--- Single manager loop guard
+bridge._tracks    = bridge._tracks or {}
 bridge._managerRunning = bridge._managerRunning or false
 
 -- Cached police roster for quick broadcasts
-local policeSet = policeSet or {}   -- [src] = true
-local policeList = policeList or {} -- array
+local policeSet = policeSet or {}
+local policeList = policeList or {}
 
--- === ESX helpers ============================================================
-
+-- === ESX helpers ===
 local function ESX() return exports['es_extended']:getSharedObject() end
-
 local function isPoliceJob(name)
     if not name then return false end
     name = name:lower()
-    for i=1, #Config.PoliceJobs do
-        if Config.PoliceJobs[i] == name then return true end
-    end
+    for i=1, #Config.PoliceJobs do if Config.PoliceJobs[i] == name then return true end end
     return false
 end
 
 local function rebuildPoliceRoster()
-    table.wipe = table.wipe or function(t) for k in pairs(t) do t[k]=nil end end
-    table.wipe(policeSet); table.wipe(policeList)
+    for k in pairs(policeSet) do policeSet[k] = nil end
+    policeList = {}
     local esx = ESX()
     if not esx or not esx.GetExtendedPlayers then return end
     local players = esx.GetExtendedPlayers()
     for i=1, #players do
         local xP = players[i]
         local job = xP.getJob() and xP.getJob().name
-        if isPoliceJob(job) then
-            policeSet[xP.source] = true
-        end
+        if isPoliceJob(job) then policeSet[xP.source] = true end
     end
-    for src in pairs(policeSet) do
-        policeList[#policeList+1] = src
-    end
+    for src in pairs(policeSet) do policeList[#policeList+1] = src end
     Debug.log.info('Police roster rebuilt (%d officers)', #policeList)
 end
 
@@ -79,13 +64,12 @@ end)
 
 CreateThread(function()
     while true do
-        Wait(60000) -- 60s
+        Wait(60000) -- 60s safety rebuild
         rebuildPoliceRoster()
     end
 end)
 
--- === Provider detection =====================================================
-
+-- === Provider detection ===
 local function isResourceStarted(name)
     local st = GetResourceState(name)
     return st == 'started' or st == 'starting'
@@ -115,26 +99,21 @@ local function detectProvider()
     return chosenProvider
 end
 
--- === Broadcasts to police ===================================================
-
+-- === Broadcast ===
 local function broadcastToCops(event, ...)
-    for i=1, #policeList do
-        TriggerClientEvent(event, policeList[i], ...)
-    end
+    for i=1, #policeList do TriggerClientEvent(event, policeList[i], ...) end
 end
 
--- === Provider sends =========================================================
-
+-- === Provider sends ===
 local function toRedutzuMDT(coords, street, hint)
     local red = Config.Dispatch.redutzu or {}
-    local payload = {
+    TriggerEvent('redutzu-mdt:server:addDispatchToMDT', {
         code   = red.code  or '10-47',
         title  = red.title or 'Drug Sale In Progress',
         street = street or 'Unknown',
         message = hint or 'Possible hand-to-hand transaction',
         coords  = { x = coords.x, y = coords.y, z = coords.z }
-    }
-    TriggerEvent('redutzu-mdt:server:addDispatchToMDT', payload)
+    })
 end
 
 local function toCdDispatch(coords, street, hint)
@@ -153,16 +132,13 @@ local function toCdDispatch(coords, street, hint)
     })
 end
 
--- === Live tracking manager ==================================================
-
+-- === Tracking manager ===
 local function ensureTrackingManager()
     if bridge._managerRunning then return end
     bridge._managerRunning = true
-
     CreateThread(function()
         local interval = (Config.Dispatch.tracking and Config.Dispatch.tracking.interval or 5) * 1000
         if interval < 1000 then interval = 1000 end
-
         while bridge._managerRunning do
             local now = GetGameTimer()
             for suspectSrc, tr in pairs(bridge._tracks) do
@@ -181,7 +157,7 @@ local function ensureTrackingManager()
                     end
                 end
             end
-            Wait(1000) -- 1s heartbeat
+            Wait(1000)
         end
     end)
 end
@@ -189,37 +165,20 @@ end
 local function startLiveTracking(suspectSrc, initialCoords)
     local tcfg = Config.Dispatch.tracking
     if not (tcfg and tcfg.enabled) then return end
-
     local id = ('trk-%d-%d'):format(suspectSrc, os.time())
     local now = GetGameTimer()
-    local duration = (tcfg.duration or 60) * 1000
-
-    bridge._tracks[suspectSrc] = {
-        id = id,
-        endAt = now + duration,
-        nextAt = now,
-    }
-
+    bridge._tracks[suspectSrc] = { id = id, endAt = now + (tcfg.duration or 60)*1000, nextAt = now }
     broadcastToCops('gs_selldrugs:policeTrackStart', {
-        id     = id,
-        name   = tcfg.name or 'Drug Sale Suspect',
-        sprite = tcfg.sprite or 161,
-        colour = tcfg.colour or 1,
-        scale  = tcfg.scale  or 1.2,
-        alpha  = tcfg.alpha  or 200,
-        route  = tcfg.route  or false,
-        coords = { x = initialCoords.x, y = initialCoords.y, z = initialCoords.z }
+        id=id, name=tcfg.name or 'Drug Sale Suspect', sprite=tcfg.sprite or 161, colour=tcfg.colour or 1,
+        scale=tcfg.scale or 1.2, alpha=tcfg.alpha or 200, route=tcfg.route or false,
+        coords = { x=initialCoords.x, y=initialCoords.y, z=initialCoords.z }
     })
-
     ensureTrackingManager()
 end
 
--- === Public API =============================================================
-
+-- === Public API ===
 function bridge.alertPolice(suspectSrc, coords, street, hint)
     if not Config.Dispatch.enabled then return end
-
-    -- Rate limit per suspect
     local now = os.time()
     local key = ('alert_cool_%s'):format(suspectSrc)
     if bridge._cooldowns[key] and now - bridge._cooldowns[key] < (Config.Dispatch.cooldown or 15) then
@@ -229,22 +188,14 @@ function bridge.alertPolice(suspectSrc, coords, street, hint)
     bridge._cooldowns[key] = now
 
     local provider = chosenProvider or detectProvider()
-    if Debug.level >= 2 then
-        Debug.log.info(('Dispatch %s @ %.1f,%.1f,%0.1f (%s) via %s'):format(
-            suspectSrc, coords.x, coords.y, coords.z, street or 'unknown', provider))
-    end
-
-    if provider == 'redutzu_mdt' then
-        toRedutzuMDT(coords, street, hint)
-    elseif provider == 'cd_dispatch' then
-        toCdDispatch(coords, street, hint)
+    Debug.log.info('Dispatch %s @ %.1f,%.1f,%.1f (%s) via %s', suspectSrc, coords.x, coords.y, coords.z, street or 'unknown', provider)
+    if provider == 'redutzu_mdt' then toRedutzuMDT(coords, street, hint)
+    elseif provider == 'cd_dispatch' then toCdDispatch(coords, street, hint)
     else
         for i=1, #policeList do
-            TriggerClientEvent('chat:addMessage', policeList[i], { args = {'^1Dispatch', ('Drug sale reported near %s'):format(street or 'unknown')} })
+            TriggerClientEvent('chat:addMessage', policeList[i], { args={'^1Dispatch', ('Drug sale reported near %s'):format(street or 'unknown')} })
         end
     end
-
-    -- Start in-resource live tracking
     startLiveTracking(suspectSrc, coords)
 end
 

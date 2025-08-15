@@ -15,4 +15,5 @@ Locales = {
     invalid        = 'Invalid or expired offer.',
     snitched       = 'They look nervous... someone might have called it in.',
     bad_product    = 'They didn\'t like the product. No deal.',
+    busy           = 'You are already in a deal.',
 }

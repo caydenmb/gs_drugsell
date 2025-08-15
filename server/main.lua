@@ -4,6 +4,8 @@ local ESX = exports['es_extended']:getSharedObject()
 
 -- Offers[token] = { src, pedNet, item, qty, priceEach, total, expiresAt, snitched }
 local Offers = {}
+-- Active deal lock: src -> expiresAt (while a token is live)
+local Active = {}
 -- Cooldowns
 local Cooldowns = { ped = {}, player = {}, globalAt = 0 }
 
@@ -46,16 +48,41 @@ end
 local function rollOffer(itemName)
     local cfg = Config.Items[itemName]
     if not cfg then return nil, 'unknown_item' end
-    -- NPC willingness
     if math.random(100) > (cfg.sellAcceptChance or 100) then
         return nil, 'reject'
     end
-    -- Price/qty/duration
     local qty = math.random(cfg.minQty, cfg.maxQty)
     local priceEach = math.random(cfg.minPrice, cfg.maxPrice)
     local duration = math.floor((Config.BaseSellDuration or 4500) * (0.75 + math.random() * 0.5))
     return { qty = qty, priceEach = priceEach, total = qty * priceEach, duration = duration }
 end
+
+-- Expired-offer sweep: free active locks cleanly
+CreateThread(function()
+    while true do
+        Wait(10000)
+        local now = os.time()
+        for t, o in pairs(Offers) do
+            if now > (o.expiresAt or 0) then
+                Active[o.src] = nil
+                Offers[t] = nil
+                Debug.log.dbg('Offer expired & cleared for %s', o.src)
+            end
+        end
+        for src, untilAt in pairs(Active) do
+            if now > untilAt then Active[src] = nil end
+        end
+    end
+end)
+
+AddEventHandler('playerDropped', function()
+    local src = source
+    -- Clear offers and lock for the dropped player
+    for t, o in pairs(Offers) do
+        if o.src == src then Offers[t] = nil end
+    end
+    Active[src] = nil
+end)
 
 -- Stage 1: request offer (no inventory change yet)
 lib.callback.register('gs_selldrugs:requestOffer', function(src, data)
@@ -67,6 +94,12 @@ lib.callback.register('gs_selldrugs:requestOffer', function(src, data)
     end
 
     local nowSec = os.time()
+
+    -- ACTIVE DEAL LOCK (anti-restart exploit)
+    if Active[src] and nowSec < Active[src] then
+        return { ok = false, reason = 'busy' }
+    end
+
     -- Cooldowns
     if nowSec - (Cooldowns.globalAt or 0) < (Config.GlobalCooldown or 5) then
         return { ok = false, reason = 'cooldown' }
@@ -105,7 +138,7 @@ lib.callback.register('gs_selldrugs:requestOffer', function(src, data)
     local _, streetHash = GetStreetNameAtCoord(coords.x, coords.y, coords.z)
     local street = streetHash and GetStreetNameFromHashKey(streetHash) or 'Unknown'
 
-    -- Ambient attempt-stage alert (low background risk)
+    -- Ambient attempt-stage alert
     local baseAlert = Config.BasePoliceAlertChance or 0
     local itemAlert = (Config.Items[item].policeAlertChance or 0)
     if (Config.Dispatch.callOnAttempt) and math.random(100) <= (baseAlert + math.floor(itemAlert/3)) then
@@ -121,14 +154,16 @@ lib.callback.register('gs_selldrugs:requestOffer', function(src, data)
         Debug.log.info('SNITCH: %s reported near %s', src, street)
     end
 
-    -- Create pending offer
+    -- Create pending offer + lock
     local t = token()
+    local exp = nowSec + 30
     Offers[t] = {
         src = src, pedNet = pedNet, item = item,
         qty = offer.qty, priceEach = offer.priceEach, total = offer.total,
-        expiresAt = nowSec + 30,
+        expiresAt = exp,
         snitched = snitch
     }
+    Active[src] = exp   -- lock player until token expires or completes
 
     Debug.log.dbg('Offer %s: %s x%d @ %d = %d (snitch=%s)', t, item, offer.qty, offer.priceEach, offer.total, tostring(snitch))
     return { ok = true, token = t, qty = offer.qty, priceEach = offer.priceEach, total = offer.total, duration = offer.duration, snitched = snitch }
@@ -140,23 +175,25 @@ lib.callback.register('gs_selldrugs:completeSale', function(src, data)
     local pedNet = data and data.ped
     local offer = t and Offers[t]
     if not offer then
+        Active[src] = nil
         return { ok = false, reason = 'invalid' }
     end
 
     if offer.src ~= src or offer.pedNet ~= pedNet or os.time() > (offer.expiresAt or 0) then
         Offers[t] = nil
+        Active[src] = nil
         return { ok = false, reason = 'expired' }
     end
 
     local ped = NetworkGetEntityFromNetworkId(offer.pedNet)
     if not DoesEntityExist(ped) then
-        Offers[t] = nil
+        Offers[t] = nil; Active[src] = nil
         return { ok = false, reason = 'no_ped' }
     end
 
     local pPed = GetPlayerPed(src)
     if #(GetEntityCoords(pPed) - GetEntityCoords(ped)) > (Config.MaxDistance or 8.0) then
-        Offers[t] = nil
+        Offers[t] = nil; Active[src] = nil
         return { ok = false, reason = 'too_far' }
     end
 
@@ -167,7 +204,7 @@ lib.callback.register('gs_selldrugs:completeSale', function(src, data)
         Cooldowns.globalAt = nowSec
         Cooldowns.player[src] = nowSec
         Cooldowns.ped[offer.pedNet] = nowSec
-        Offers[t] = nil
+        Offers[t] = nil; Active[src] = nil
         Debug.log.info('BAD PRODUCT: ped %s refused %s from %s', tostring(offer.pedNet), offer.item, src)
         return { ok = false, reason = 'bad_product' }  -- items kept
     end
@@ -175,19 +212,19 @@ lib.callback.register('gs_selldrugs:completeSale', function(src, data)
     -- Proceed with normal sale
     local have = exports.ox_inventory:Search(src, 'count', offer.item)
     if (have or 0) < offer.qty then
-        Offers[t] = nil
+        Offers[t] = nil; Active[src] = nil
         return { ok = false, reason = 'no_items' }
     end
 
     if not exports.ox_inventory:RemoveItem(src, offer.item, offer.qty) then
-        Offers[t] = nil
+        Offers[t] = nil; Active[src] = nil
         Debug.log.warn('RemoveItem failed for %s x%d from %s', offer.item, offer.qty, src)
         return { ok = false, reason = 'fail' }
     end
 
     local xPlayer = ESX.GetPlayerFromId(src)
     if not xPlayer then
-        Offers[t] = nil
+        Offers[t] = nil; Active[src] = nil
         return { ok = false, reason = 'fail' }
     end
 
@@ -212,7 +249,7 @@ lib.callback.register('gs_selldrugs:completeSale', function(src, data)
         TriggerClientEvent('gs_selldrugs:client:alert', src)
     end
 
-    Offers[t] = nil
+    Offers[t] = nil; Active[src] = nil
     Debug.log.info('Sold %s x%d to ped %s for $%d', offer.item, offer.qty, tostring(offer.pedNet), offer.total)
     return { ok = true, total = offer.total }
 end)

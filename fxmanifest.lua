@@ -3,7 +3,7 @@ game 'gta5'
 lua54 'yes'
 
 name 'gs_selldrugs'
-description 'Secure, optimized NPC drug selling for ESX using ox_inventory & ox_lib; dispatch via redutzu_mdt or cd_dispatch; live police tracking + snitch/bad-product + ped handoff animation'
+description 'Optimized NPC drug selling for ESX with ox_inventory/ox_lib, MDT dispatch (10-47), live tracking, third-eye support, anti-exploit locks, and polished ped handoff.'
 author 'Gingr Snaps'
 version '1.0.0'
 
@@ -21,7 +21,7 @@ shared_scripts {
 }
 
 server_scripts {
-    '@oxmysql/lib/MySQL.lua',  -- harmless if unused
+    '@oxmysql/lib/MySQL.lua',
     'server/dispatch_bridge.lua',
     'server/main.lua'
 }

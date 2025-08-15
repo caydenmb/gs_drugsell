@@ -12,7 +12,6 @@ local function getPedInFront(maxDist)
     local coords = GetEntityCoords(ped)
     local fwd = GetEntityForwardVector(ped)
     local dest = coords + (fwd * (maxDist or 2.5))
-
     local ray = StartShapeTestCapsule(coords, dest, 0.6, 12, ped, 7)
     local _, hit, _, _, entity = GetShapeTestResult(ray)
     if hit == 1 and DoesEntityExist(entity) and IsEntityAPed(entity)
@@ -28,11 +27,11 @@ local function chooseItem()
     end
 end
 
--- === Ped Approach / Handoff Anim ===========================================
+-- === Ped Approach / Handoff Anim (tight, AC-friendly) ======================
 
 local function requestControl(entity, attempts, waitMs)
-    attempts = attempts or 8
-    waitMs   = waitMs or 60
+    attempts = attempts or 6
+    waitMs   = waitMs or 50
     if not DoesEntityExist(entity) then return false end
     if NetworkHasControlOfEntity(entity) then return true end
     NetworkRequestControlOfEntity(entity)
@@ -50,73 +49,60 @@ end
 local function loadAnimDict(dict)
     if HasAnimDictLoaded(dict) then return true end
     RequestAnimDict(dict)
-    local timeout = GetGameTimer() + 1500
+    local timeout = GetGameTimer() + 1200
     while not HasAnimDictLoaded(dict) and GetGameTimer() < timeout do
         Wait(0)
     end
     return HasAnimDictLoaded(dict)
 end
 
--- Gently step the NPC closer and face the player, then play a short handoff anim.
--- Fully optional; if anything fails, we proceed without it.
 local function pedHandoffStep(ped)
     local cfg = Config.PedApproach
     if not (cfg and cfg.enabled) then return end
-    if not DoesEntityExist(ped) or IsPedDeadOrDying(ped, true) then return end
+    if not DoesEntityExist(ped) or IsPedDeadOrDying(ped, true) or IsPedInAnyVehicle(ped, false) then return end
 
     local me = PlayerPedId()
     local mePos = GetEntityCoords(me)
     local pedPos = GetEntityCoords(ped)
-
     local dist = #(mePos - pedPos)
-    if dist <= (cfg.minDistance or 1.4) then
-        -- Already close enough; optionally face & anim only
-        if cfg.facePlayer then TaskTurnPedToFaceEntity(ped, me, 800) end
-    else
-        -- Step towards player up to maxStep; compute a target point slightly in front of player
+
+    if dist > (cfg.minDistance or 1.4) then
         local fwd = GetEntityForwardVector(me)
-        local desired = mePos - (fwd * 0.5) -- half meter in front of player
-        -- Clamp step distance
-        if #(desired - pedPos) > (cfg.maxStep or 2.5) then
-            local dir = (desired - pedPos)
-            local len = #(dir)
-            if len > 0.01 then
-                dir = dir / len
-                desired = pedPos + dir * (cfg.maxStep or 2.5)
-            end
+        local desired = mePos - (fwd * 0.5)
+        local delta = desired - pedPos
+        local dlen = #(delta)
+        if dlen > (cfg.maxStep or 2.5) then
+            delta = delta / dlen
+            desired = pedPos + delta * (cfg.maxStep or 2.5)
         end
 
         if requestControl(ped) then
-            ClearPedTasks(ped)
-            TaskGoStraightToCoord(ped, desired.x, desired.y, desired.z, 1.0, (cfg.timeout or 2500), 0.0, 0.0)
-            local endAt = GetGameTimer() + (cfg.timeout or 2500)
-            -- Wait briefly for them to get closer OR timeout
+            ClearPedTasks(ped) -- permissible; short-lived
+            TaskGoStraightToCoord(ped, desired.x, desired.y, desired.z, 1.0, (cfg.timeout or 2000), 0.0, 0.0)
+            local endAt = GetGameTimer() + (cfg.timeout or 2000)
             while GetGameTimer() < endAt do
                 if #(GetEntityCoords(ped) - mePos) <= (cfg.minDistance or 1.4) then break end
-                Wait(50)
+                Wait(40)
             end
-            if cfg.facePlayer then TaskTurnPedToFaceEntity(ped, me, 800) end
         end
     end
 
-    -- Optional freeze (usually unnecessary)
-    if cfg.pedFreeze then FreezeEntityPosition(ped, true) end
+    if cfg.facePlayer then TaskTurnPedToFaceEntity(ped, me, 600) end
 
-    -- Play NPC handoff anim (upper-body only) while our own progress bar runs
+    if cfg.pedFreeze then FreezeEntityPosition(ped, true) end
     local dict, clip, flag = cfg.anim.dict, cfg.anim.clip, cfg.anim.flag or 49
     if dict and clip and loadAnimDict(dict) then
         TaskPlayAnim(ped, dict, clip, 4.0, -4.0, -1, flag, 0.0, false, false, false)
     end
-
-    -- Release freeze shortly after (in case of long progress times)
     if cfg.pedFreeze then
-        SetTimeout(1200, function()
+        SetTimeout(1000, function()
             if DoesEntityExist(ped) then FreezeEntityPosition(ped, false) end
         end)
     end
 end
 
 -- === Sale flow ==============================================================
+
 RegisterNetEvent('gs_selldrugs:client:alert', function()
     notify(L.alert_sent, 'warning', 4000)
 end)
@@ -139,27 +125,29 @@ RegisterNetEvent('gs_selldrugs:client:trySell', function(pedNet)
         elseif r == 'cops'     then notify(L.cops_low, 'inform')
         elseif r == 'zone'     then notify(L.zone_block, 'inform')
         elseif r == 'no_items' then notify(L.no_items, 'error')
+        elseif r == 'busy'     then notify(L.busy, 'warning')
         else                        notify(L.failed, 'error') end
         return
     end
 
-    -- If server rolled a snitch, give a subtle warning to the player
-    if offer.snitched then
-        notify(L.snitched, 'warning', 4500)
-    end
+    if offer.snitched then notify(L.snitched, 'warning', 4500) end
 
-    -- NEW: ask NPC to step closer & face us; play their handoff anim
     pedHandoffStep(ped)
 
     local success = lib.progressBar({
         duration = offer.duration or 4000,
         label = L.selling,
         useWhileDead = false,
-        canCancel = true,
-        disable = { move = true, car = true, combat = true },
-        anim = { dict = 'mp_common', clip = 'givetake1_a' }, -- player anim
+        -- EXPLOIT GUARD: no cancelling
+        canCancel = false,
+        disable = { move = true, car = true, combat = true, sprint = true, mouse = true },
+        anim = { dict = 'mp_common', clip = 'givetake1_a' },
     })
-    if not success then return notify(L.canceled, 'inform') end
+    if not success then
+        -- This should rarely happen with canCancel=false; rely on server lock auto-expiring.
+        notify(L.failed, 'error')
+        return
+    end
 
     if #(GetEntityCoords(PlayerPedId()) - GetEntityCoords(ped)) > (Config.MaxDistance or 8.0) then
         return notify(L.too_far, 'error')
@@ -219,15 +207,16 @@ RegisterNetEvent('gs_selldrugs:policeTrackStart', function(info)
     local blip = makeBlip(info)
     Tracks[info.id] = blip
 
-    -- Auto-remove after configured duration (no polling loop)
+    -- FIX: correctly reference id for cleanup
+    local id = info.id
     local duration = (Config.Dispatch.tracking and Config.Dispatch.tracking.duration or 60) * 1000
     SetTimeout(duration + 500, function()
-        local b = Tracks[info.id]
+        local b = Tracks[id]
         if b and DoesBlipExist(b) then RemoveBlip(b) end
-        Tracks[info.id] = nil
-        Debug.log.warn('Police tracking auto-cleared: %s', info.id)
+        Tracks[id] = nil
+        Debug.log.warn('Police tracking auto-cleared: %s', id)
     end)
-    Debug.log.info('Police tracking started: %s', info.id)
+    Debug.log.info('Police tracking started: %s', id)
 end)
 
 RegisterNetEvent('gs_selldrugs:policeTrackUpdate', function(id, coords)
